@@ -1,0 +1,9 @@
+bin/
+obj/
+*.pdb
+*.log
+*.user
+.vs/
+.env
+.env.*
+__pycache__/
