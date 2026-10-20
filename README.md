@@ -1,6 +1,8 @@
-# Remember Save Fix
+# Remember Save Fix — Welcome to the Game II
 
-WTTG2 Wi-Fi password memory fix for loaded saves.
+Wi-Fi password fix for loaded saves in Welcome to the Game II (WTTG2). Add-on for Epic Remember Networks.
+
+**Скачать:** [готовые файлы](https://github.com/x1pee/wttg2-remember-save-fix/releases/tag/v1.0.0).
 
 Дополнение к Epic Remember Networks 1.0.0. Восстанавливает связь с ранее сохранёнными паролями после загрузки того же мира по BSSID и типу защиты. Не открывает неизвестные пароли; противоречивые записи пропускаются. Оригинальный Epic_RememberNetworks.dll нужен и остаётся отдельной зависимостью.
 
