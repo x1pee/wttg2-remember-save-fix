@@ -9,7 +9,7 @@ using UnityEngine;
 
 namespace Wttg2RememberSaveFix
 {
-    [BepInPlugin(PluginGuid, "WTTG2 Remember Save Fix", "1.0.0")]
+    [BepInPlugin(PluginGuid, "WTTG2 Remember Save Fix", "1.0.1")]
     [BepInDependency("Epic_RememberNetworks", BepInDependency.DependencyFlags.HardDependency)]
     public sealed class RememberSaveFix : BaseUnityPlugin
     {
@@ -25,7 +25,17 @@ namespace Wttg2RememberSaveFix
         private MethodInfo writeState, refreshRows;
         private bool failed;
         private bool pending;
+        private bool stageLoaded;
+        private bool restoring;
+        private WifiManager restoredWifi;
+        private string restoredScope;
         private float retryAt, retryUntil;
+
+        private sealed class RejectedCredential
+        {
+            public IDictionary Store;
+            public string Scope, Key, Password;
+        }
 
         private void Awake()
         {
@@ -45,6 +55,10 @@ namespace Wttg2RememberSaveFix
                 harmony.Patch(RequiredMethod(legacyType, "OnDialogPresent"), beforeUse);
                 harmony.Patch(RequiredMethod(legacyType, "OnRowBuild"), beforeUse);
                 harmony.Patch(RequiredMethod(legacyType, "OnGameplayTeardown"), new HarmonyMethod(typeof(RememberSaveFix).GetMethod("BeforeTeardown", BindingFlags.Static | BindingFlags.NonPublic)));
+                harmony.Patch(RequiredMethod(legacyType, "OnGameDataCleared"), new HarmonyMethod(typeof(RememberSaveFix).GetMethod("BeforeTeardown", BindingFlags.Static | BindingFlags.NonPublic)));
+                harmony.Patch(RequiredMethod(legacyType, "RemoveCredential"),
+                    new HarmonyMethod(typeof(RememberSaveFix).GetMethod("BeforeRemove", BindingFlags.Static | BindingFlags.NonPublic)),
+                    new HarmonyMethod(typeof(RememberSaveFix).GetMethod("AfterRemove", BindingFlags.Static | BindingFlags.NonPublic)));
                 Logger.LogInfo("Loaded-save scope hook installed. Only BSSID/security identities and existing remembered records are used.");
             }
             catch (Exception ex) { Fail("Could not bind the installed Epic Remember Networks; bridge disabled", ex); }
@@ -94,6 +108,8 @@ namespace Wttg2RememberSaveFix
         private static void BeforeStage(object __instance)
         {
             if (self == null || self.failed || !self.enabledEntry.Value) return;
+            self.ClearRestoreState();
+            self.stageLoaded = true;
             self.pending = true;
             self.retryAt = 0;
             self.retryUntil = Time.unscaledTime + 90f;
@@ -101,13 +117,81 @@ namespace Wttg2RememberSaveFix
         }
         private static void BeforeUse(object __instance)
         {
-            if (self == null || self.failed || !self.enabledEntry.Value) return;
+            if (self == null || self.failed || !self.enabledEntry.Value || !self.stageLoaded) return;
             // This synchronous guard also covers unusually slow staging and a reopened menu.
             self.TryRestore(__instance);
         }
         private static void BeforeTeardown()
         {
-            if (self != null) self.pending = false;
+            if (self != null) self.ClearRestoreState();
+        }
+        private void ClearRestoreState()
+        {
+            pending = false;
+            stageLoaded = false;
+            restoredWifi = null;
+            restoredScope = null;
+        }
+        private static void BeforeRemove(object __instance, string __0, string __1, out object __state)
+        {
+            __state = null;
+            if (self == null || self.failed || !self.enabledEntry.Value) return;
+            try { __state = self.CaptureRejectedCredential(__instance, __0, __1); }
+            catch (Exception ex) { self.Fail("Could not bind credential invalidation; bridge disabled", ex); }
+        }
+        private static void AfterRemove(object __instance, bool __result, object __state)
+        {
+            if (!__result || __state == null || self == null || self.failed) return;
+            try
+            {
+                int removed = self.RemoveRejectedAliases((RejectedCredential)__state);
+                if (removed != 0 && ConfigBool(self.rememberField, __instance))
+                    self.writeState.Invoke(__instance, new object[] { true });
+            }
+            catch (Exception ex) { self.Fail("Could not finish credential invalidation; bridge disabled", ex); }
+        }
+        private RejectedCredential CaptureRejectedCredential(object legacy, string scope, string key)
+        {
+            if (!System.Object.ReferenceEquals(legacy, instanceField.GetValue(null)) ||
+                !ConfigBool(enabledLegacyField, legacy) || !ConfigBool(separateField, legacy) ||
+                String.Equals(scope, "global", StringComparison.Ordinal) ||
+                !String.Equals(scope, restoredScope, StringComparison.Ordinal)) return null;
+            IDictionary store = (IDictionary)(ConfigBool(rememberField, legacy) ? persistedField : sessionField).GetValue(legacy);
+            IDictionary records = store.Contains(scope) ? store[scope] as IDictionary : null;
+            object record = records != null && records.Contains(key) ? records[key] : null;
+            if (!RecordMatches(record, scope, key)) return null;
+            return new RejectedCredential { Store = store, Scope = scope, Key = key,
+                Password = credentialPasswordField.GetValue(record) as string };
+        }
+        private int RemoveRejectedAliases(RejectedCredential rejected)
+        {
+            // Epic calls RemoveCredential only after vanilla password rejection. Forget matching
+            // migration sources too; otherwise they reappear on the next load/menu refresh.
+            int removed = 0;
+            List<object> emptyScopes = new List<object>();
+            foreach (DictionaryEntry scope in rejected.Store)
+            {
+                string scopeId = scope.Key as string;
+                if (String.Equals(scopeId, "global", StringComparison.Ordinal) ||
+                    String.Equals(scopeId, rejected.Scope, StringComparison.Ordinal)) continue;
+                IDictionary records = scope.Value as IDictionary;
+                object record = records != null && records.Contains(rejected.Key) ? records[rejected.Key] : null;
+                if (!RecordMatches(record, scopeId, rejected.Key) ||
+                    !String.Equals(credentialPasswordField.GetValue(record) as string, rejected.Password, StringComparison.Ordinal)) continue;
+                records.Remove(rejected.Key);
+                if (records.Count == 0) emptyScopes.Add(scope.Key);
+                removed++;
+            }
+            foreach (object scope in emptyScopes) rejected.Store.Remove(scope);
+            return removed;
+        }
+        private bool RecordMatches(object record, string scope, string key)
+        {
+            if (record == null || key == null || scope == null ||
+                !String.Equals(credentialSaveField.GetValue(record) as string, scope, StringComparison.Ordinal)) return false;
+            string bssid = credentialBssidField.GetValue(record) as string;
+            string storedKey = RememberScopePolicy.NetworkKey((int)credentialSecurityField.GetValue(record), bssid);
+            return String.Equals(key, storedKey, StringComparison.Ordinal);
         }
         private void Update()
         {
@@ -123,8 +207,11 @@ namespace Wttg2RememberSaveFix
         }
         private void TryRestore(object legacy)
         {
+            if (restoring) return;
+            restoring = true;
             try { if (RestoreScope(legacy)) pending = false; }
-            catch (Exception ex) { self.Fail("Loaded-save scope recovery failed; original Remember Networks remains available", ex); }
+            catch (Exception ex) { Fail("Loaded-save scope recovery failed; original Remember Networks remains available", ex); }
+            finally { restoring = false; }
         }
 
         private bool RestoreScope(object legacy)
@@ -135,10 +222,13 @@ namespace Wttg2RememberSaveFix
             if (managers == null) return false;
             WifiManager wifi = managers.WifiManager;
             if (wifi == null) return false;
+            string previous = saveField.GetValue(legacy) as string;
+            if (System.Object.ReferenceEquals(restoredWifi, wifi) &&
+                String.Equals(previous, restoredScope, StringComparison.Ordinal)) return true;
             HashSet<string> keys = new HashSet<string>(StringComparer.Ordinal);
             foreach (WifiNetworkDefinition network in wifi.GetAllWifiNetworks())
             {
-                if (network == null) continue;
+                if (network == null) return false;
                 if ((int)network.networkSecurity < 1) continue;
                 string key = RememberScopePolicy.NetworkKey((int)network.networkSecurity, network.networkBSSID);
                 // Never fingerprint a partly initialized list: another hotspot may stage later.
@@ -155,8 +245,9 @@ namespace Wttg2RememberSaveFix
                 recovered += RecoverMatchingRecords(persisted, scope, keys);
                 recovered += RecoverMatchingRecords(session, scope, keys);
             }
-            string previous = saveField.GetValue(legacy) as string;
             saveField.SetValue(legacy, scope);
+            restoredWifi = wifi;
+            restoredScope = scope;
             if (!String.Equals(previous, scope, StringComparison.Ordinal) || recovered != 0)
             {
                 // Use the original plugin's existing atomic writer/backup; this bridge has no credential file format.
@@ -182,10 +273,7 @@ namespace Wttg2RememberSaveFix
                 foreach (DictionaryEntry record in records)
                 {
                     string key = record.Key as string;
-                    if (key == null || !activeKeys.Contains(key) || record.Value == null) continue;
-                    string bssid = credentialBssidField.GetValue(record.Value) as string;
-                    string storedKey = RememberScopePolicy.NetworkKey((int)credentialSecurityField.GetValue(record.Value), bssid);
-                    if (!String.Equals(key, storedKey, StringComparison.Ordinal)) continue;
+                    if (key == null || !activeKeys.Contains(key) || !RecordMatches(record.Value, scope.Key as string, key)) continue;
                     object existing;
                     if (candidates.TryGetValue(key, out existing) &&
                         !String.Equals(credentialPasswordField.GetValue(existing) as string,

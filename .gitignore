@@ -7,3 +7,6 @@ obj/
 .env
 .env.*
 __pycache__/
+/WTTG2RememberSaveFix.dll
+/RememberFixTests.exe
+/test-state/

@@ -1,4 +1,4 @@
-WTTG2 Remember Save Fix 1.0.0
+WTTG2 Remember Save Fix 1.0.1
 For the installed Epic Remember Networks 1.0.0 / BepInEx 5.4.23.5 / Unity 2017.3.
 
 What failed
@@ -25,6 +25,14 @@ World staging can precede Wi-Fi initialization. The add-on waits for all secure
 network identities, retries every 0.25 seconds for up to 90 seconds, and also
 checks immediately before Remember Networks handles a row/password dialog.
 Original game methods are never skipped, replaced, or called to authenticate.
+Recovery only starts after the legacy stage-loaded notification, so rows built
+while another hotspot is still staging cannot cache a mixed-world identity.
+The completed identity is cached until stage reload, clear, or teardown.
+
+If vanilla authentication rejects a migrated password, exact old copies with
+the same BSSID/security/password are forgotten too. Otherwise those copies
+could restore the rejected password again after opening a dialog or restarting.
+Global records, unrelated networks and records with different passwords remain.
 
 Installation
 1. Close the game.
@@ -50,13 +58,16 @@ NoSaveDelete and Remote VPN Green Fix are not modified by this add-on.
 
 Build and checks
 Run build.ps1 -GamePath '<game folder>' -MonoPath '<Mono folder>' -Test.
+Build outputs and synthetic test-state files go into ignored bin/ by default;
+use -OutputPath to choose another folder. Install only WTTG2RememberSaveFix.dll.
 The build deliberately targets CLR 2.0 plus System.Core 3.5. Using the Mono
 compiler's unavailable -sdk:3.5 on this machine silently selected CLR 4; do not
 substitute it for -sdk:2.
-Twenty-two tests pass against the installed Epic record type and state writer/parser,
+Thirty-nine tests pass against the installed Epic record type and state writer/parser,
 using synthetic credentials only. They include isolation between different
 BSSIDs, ambiguous-record rejection, not inventing unknown credentials,
-idempotent migration, correct SaveId serialization, and atomic backup creation.
+idempotent migration, correct SaveId serialization, atomic backup creation and
+verified-rejection cleanup that persists through the real state writer/parser.
 Actual Unity runtime/load/autofill results are recorded separately by the main QA
 run. Compilation and these tests alone are not proof of live keyboard/UI behavior.
 

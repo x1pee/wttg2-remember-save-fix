@@ -27,8 +27,13 @@ namespace Wttg2RememberSaveFix
 
         public static string SaveScope(IEnumerable<string> networkKeys)
         {
+            if (networkKeys == null) return null;
             SortedDictionary<string, bool> keys = new SortedDictionary<string, bool>(StringComparer.Ordinal);
-            foreach (string key in networkKeys) if (!String.IsNullOrEmpty(key)) keys[key] = true;
+            foreach (string key in networkKeys)
+            {
+                if (String.IsNullOrEmpty(key)) return null;
+                keys[key] = true;
+            }
             if (keys.Count < 2) return null;
             StringBuilder identity = new StringBuilder("WTTG2-RememberSaveFix-v1\n");
             foreach (string key in keys.Keys) identity.Append(key).Append('\n');

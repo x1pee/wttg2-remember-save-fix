@@ -13,6 +13,15 @@ class RememberFixTests
     { if (!condition) throw new Exception("FAILED: " + name); passed++; Console.WriteLine("PASS " + name); }
     static void Set(object instance, string name, object value)
     { instance.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public).SetValue(instance, value); }
+    static object Clone(object value)
+    { return typeof(object).GetMethod("MemberwiseClone", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(value, null); }
+    static object BoolEntry(Assembly bepinex, bool value)
+    {
+        Type type = bepinex.GetType("BepInEx.Configuration.ConfigEntry`1", true).MakeGenericType(typeof(bool));
+        object entry = FormatterServices.GetUninitializedObject(type);
+        Set(entry, "_typedValue", value);
+        return entry;
+    }
     static void Main(string[] args)
     {
         string game = args[0];
@@ -40,6 +49,8 @@ class RememberFixTests
         Check(scope == RememberScopePolicy.SaveScope(new string[] { b, a, a }), "scope survives ordering and duplicates");
         Check(scope != RememberScopePolicy.SaveScope(new string[] { a, c }), "new save BSSIDs yield isolated scope");
         Check(RememberScopePolicy.SaveScope(new string[] { a }) == null, "partial initialization does not create scope");
+        Check(RememberScopePolicy.SaveScope(new string[] { a, b, null }) == null, "missing identity cannot produce partial scope");
+        Check(RememberScopePolicy.SaveScope(null) == null, "missing network list defers restoration");
         Check(new Guid(scope).ToString("N") == scope, "scope accepted by legacy GUID format");
 
         Assembly legacy = Assembly.LoadFrom(Path.Combine(game, "BepInEx/plugins/Epic_RememberNetworks.dll"));
@@ -69,14 +80,18 @@ class RememberFixTests
         Check(!((IDictionary)store[scope]).Contains(b), "unlearned network is not invented");
 
         IDictionary other = (IDictionary)Activator.CreateInstance(recordMap);
-        object conflict = typeof(object).GetMethod("MemberwiseClone", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(record, null);
-        Set(conflict, "Password", "synthetic-learned-B"); other.Add(a, conflict); store.Add(new string('2', 32), other);
+        object conflict = Clone(record);
+        Set(conflict, "SaveId", new string('2',32)); Set(conflict, "Password", "synthetic-learned-B"); other.Add(a, conflict); store.Add(new string('2', 32), other);
         string anotherScope = new string('3', 32);
         Check((int)recover.Invoke(fix, new object[] { store, anotherScope, keys }) == 0 && !store.Contains(anotherScope), "ambiguous known passwords skipped");
-        IDictionary globalOnly = (IDictionary)Activator.CreateInstance(storeType); globalOnly.Add("global", oldRecords);
+        IDictionary globalRecords = (IDictionary)Activator.CreateInstance(recordMap);
+        object globalRecord = Clone(record); Set(globalRecord, "SaveId", "global"); globalRecords.Add(a, globalRecord);
+        IDictionary globalOnly = (IDictionary)Activator.CreateInstance(storeType); globalOnly.Add("global", globalRecords);
         Check((int)recover.Invoke(fix, new object[] { globalOnly, scope, keys }) == 0, "global-mode records do not leak into isolated saves");
         IDictionary unrelated = (IDictionary)Activator.CreateInstance(storeType); unrelated.Add(new string('1',32), oldRecords);
         Check((int)recover.Invoke(fix, new object[] { unrelated, scope, new HashSet<string>(new string[] { b, c }) }) == 0, "different-save BSSID records excluded");
+        IDictionary mismatched = (IDictionary)Activator.CreateInstance(storeType); mismatched.Add(new string('9',32), oldRecords);
+        Check((int)recover.Invoke(fix, new object[] { mismatched, scope, keys }) == 0, "record identity must match containing scope");
         Type legacyType = legacy.GetType("EpicMods.WTTG2.RememberNetworks.EpicRememberNetworksPlugin", true);
         object legacyWriter = FormatterServices.GetUninitializedObject(legacyType);
         Type loggerType = Assembly.LoadFrom(Path.Combine(game, "BepInEx/core/BepInEx.dll")).GetType("BepInEx.Logging.ManualLogSource", true);
@@ -96,6 +111,55 @@ class RememberFixTests
         Check((string)readArgs[1] == scope && ((IDictionary)readArgs[2]).Contains(scope), "recovered scope persists through real state writer/parser");
         writer.Invoke(legacyWriter, new object[] { true });
         Check(File.Exists(statePath + ".bak"), "legacy atomic replacement backup survives recovery write");
+
+        // Reproduce vanilla rejection after migration using the installed legacy RemoveCredential,
+        // the production capture/cleanup helpers, and the installed state writer/parser.
+        // Harmony dispatch and Unity object liveness require a separate in-game test.
+        object on = BoolEntry(loggerType.Assembly, true), off = BoolEntry(loggerType.Assembly, false);
+        Set(fix, "enabledEntry", on); Set(fix, "restoredScope", scope);
+        bridgeType.GetField("self", BindingFlags.Static | BindingFlags.NonPublic).SetValue(null, fix);
+        legacyType.GetField("Instance", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public).SetValue(null, legacyWriter);
+        Set(legacyWriter, "enabledEntry", on); Set(legacyWriter, "separateCredentialsBySaveEntry", on);
+        Set(legacyWriter, "rememberAcrossSessionsEntry", on);
+        IDictionary rejectionStore = (IDictionary)Activator.CreateInstance(storeType);
+        rejectionStore.Add(new string('1',32), oldRecords);
+        Check((int)recover.Invoke(fix, new object[] { rejectionStore, scope, keys }) == 1, "rejection fixture migrates one existing credential");
+        rejectionStore.Add(new string('2',32), other); rejectionStore.Add("global", globalRecords);
+        Set(legacyWriter, "persistedCredentials", rejectionStore);
+        MethodInfo captureRejected = bridgeType.GetMethod("CaptureRejectedCredential", BindingFlags.Instance | BindingFlags.NonPublic);
+        MethodInfo forgetAliases = bridgeType.GetMethod("RemoveRejectedAliases", BindingFlags.Instance | BindingFlags.NonPublic);
+        MethodInfo remove = legacyType.GetMethod("RemoveCredential", BindingFlags.Instance | BindingFlags.NonPublic);
+        object rejected = captureRejected.Invoke(fix, new object[] { legacyWriter, scope, a });
+        Check(rejected != null, "invalidation capture finds only existing active credential");
+        bool removed = (bool)remove.Invoke(legacyWriter, new object[] { scope, a });
+        Check(removed && !rejectionStore.Contains(scope), "real legacy invalidation removes final target record and scope");
+        Check((int)forgetAliases.Invoke(fix, new object[] { rejected }) == 1, "rejection cleanup removes exactly one matching source");
+        writer.Invoke(legacyWriter, new object[] { true });
+        Check(!rejectionStore.Contains(new string('1',32)), "matching rejected legacy alias is forgotten");
+        Check((int)forgetAliases.Invoke(fix, new object[] { rejected }) == 0, "rejected alias cleanup is idempotent");
+        Check(rejectionStore.Contains(new string('2',32)), "different remembered password is preserved for ambiguity review");
+        Check(rejectionStore.Contains("global"), "global records are never changed by save-specific rejection");
+        readArgs = new object[] { statePath, null, null, 0 };
+        Check((bool)reader.Invoke(legacyWriter, readArgs), "post-rejection file still parses with original reader");
+        IDictionary reread = (IDictionary)readArgs[2];
+        Check(!reread.Contains(new string('1',32)) && reread.Contains("global"), "rejected alias cleanup survives restart without touching global records");
+
+        // Without an alternate password, an invalidated old alias must not be recovered again.
+        reread.Remove(new string('2',32));
+        Check((int)recover.Invoke(fix, new object[] { reread, scope, keys }) == 0, "rejected password cannot resurrect from legacy alias after restart");
+        Set(legacyWriter, "separateCredentialsBySaveEntry", off);
+        Check(captureRejected.Invoke(fix, new object[] { legacyWriter, scope, a }) == null, "global configuration disables alias invalidation hook");
+        Set(legacyWriter, "separateCredentialsBySaveEntry", on);
+        Check(captureRejected.Invoke(fix, new object[] { legacyWriter, new string('8',32), a }) == null, "another world's scope is never captured for invalidation");
+
+        Set(fix, "pending", true); Set(fix, "stageLoaded", true); Set(fix, "restoredScope", scope);
+        bridgeType.GetMethod("ClearRestoreState", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(fix, null);
+        Check(!(bool)bridgeType.GetField("pending", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(fix) &&
+            !(bool)bridgeType.GetField("stageLoaded", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(fix) &&
+            bridgeType.GetField("restoredScope", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(fix) == null,
+            "clear/load teardown discards completed-world cache and pending retry");
+        bridgeType.GetField("self", BindingFlags.Static | BindingFlags.NonPublic).SetValue(null, null);
+        legacyType.GetField("Instance", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public).SetValue(null, null);
         Console.WriteLine("TOTAL " + passed + " passed; synthetic credentials only; no live game or save modified.");
     }
 }
